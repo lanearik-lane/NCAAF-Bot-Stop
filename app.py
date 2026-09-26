@@ -594,6 +594,55 @@ def sportsref_schedule_fallback(season: int, start, end):
     return games, None, url
 
 
+def espn_schedule(start, end):
+    """ESPN public scoreboard JSON (no key). Most reliable source on Streamlit Cloud."""
+    url = (
+        "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard"
+        f"?dates={start:%Y%m%d}-{end:%Y%m%d}&groups=80&limit=1000"
+    )
+    games = []
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        events = r.json().get("events", [])
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}", url
+    for ev in events:
+        try:
+            comp = ev["competitions"][0]
+            if comp.get("status", {}).get("type", {}).get("state") == "post":
+                continue
+            teams = {c.get("homeAway"): c for c in comp.get("competitors", [])}
+            if "home" not in teams or "away" not in teams:
+                continue
+            kickoff = datetime.fromisoformat(ev["date"].replace("Z", "+00:00")).astimezone(ET)
+            if not (start <= kickoff.date() <= end):
+                continue
+            tbd = bool(comp.get("timeValid") is False or ev.get("timeValid") is False)
+            side = {}
+            for k in ("home", "away"):
+                t = teams[k].get("team", {})
+                name = t.get("location") or t.get("shortDisplayName") or t.get("displayName", "")
+                side[k] = {
+                    "name": name, "key": norm(name), "id": t.get("id"),
+                    "abbr": t.get("abbreviation", ""), "cbs_code": "", "logo": t.get("logo"),
+                }
+            games.append({
+                "id": f"espn-{ev.get('id')}",
+                "date": kickoff,
+                "date_label": kickoff.strftime("%A • %B %d, %Y"),
+                "time_label": "TBD" if tbd else kickoff.strftime("%I:%M %p").lstrip("0"),
+                "away": side["away"],
+                "home": side["home"],
+                "neutral": bool(comp.get("neutralSite")),
+                "week": (ev.get("week") or {}).get("number"),
+                "schedule_source": "ESPN",
+            })
+        except Exception:
+            continue
+    return games, None if games else "ESPN returned 0 upcoming games", url
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def schedule_pack(season: int, start_iso: str, days: int):
     start = datetime.fromisoformat(start_iso).date()
@@ -602,7 +651,15 @@ def schedule_pack(season: int, start_iso: str, days: int):
     urls = []
     games = []
 
-    # CBS is the primary schedule source because Sports-Reference often returns 403 on Streamlit Cloud.
+    # ESPN's public JSON API is primary: fast, structured, and not blocked on Streamlit Cloud.
+    espn_games, espn_err, espn_url = espn_schedule(start, end)
+    if espn_games:
+        espn_games.sort(key=lambda g: g["date"])
+        return {"games": espn_games, "error": None, "errors": {}, "urls": [espn_url], "url": espn_url, "source": "ESPN"}
+    errors["ESPN"] = espn_err
+    urls.append(espn_url)
+
+    # CBS scraping is the fallback.
     base_urls = {
         "CBS FBS": "https://www.cbssports.com/college-football/schedule/",
         "CBS FCS": "https://www.cbssports.com/college-football/schedule/FCS/",
@@ -1430,7 +1487,7 @@ with st.spinner("Loading the upcoming schedule..."):
 
 if not sp["games"]:
     st.error("The schedule source did not load. The app stopped instead of hanging or inventing games.")
-    st.caption("CBS Sports is primary. If its page loads but markup changes, the parser diagnostic below will say so. Sports-Reference is only a last-resort fallback and may return 403 on Streamlit Cloud.")
+    st.caption("ESPN is primary, CBS Sports is the fallback. If its page loads but markup changes, the parser diagnostic below will say so. Sports-Reference is only a last-resort fallback and may return 403 on Streamlit Cloud.")
     if sp.get("errors"):
         st.code("\n".join(f"{k}: {v}" for k, v in sp["errors"].items()))
     st.stop()
